@@ -1,5 +1,6 @@
 #include "../include/hw8.h"
 
+#include "../include/util/list.h"
 #include "../include/util/memory.h"
 #include "../include/util/thread.h"
 #include "../include/util/file.h"
@@ -7,6 +8,7 @@
 #include "../include/util/guard.h"
 #include "../include/util/error.h"
 #include "../include/util/regex.h"
+#include "../include/util/macro.h"
 
 #include <stdlib.h>
 #include <time.h>
@@ -23,14 +25,33 @@ static regex_t endTransactionSectionRegex;
 
 static void ensureInitialized(void);
 
+struct Page {
+    char const *owner;
+    bool referenced;
+    bool modified;
+};
+DEFINE_CIRCULAR_LINKED_LIST(Pages, struct Page)
+DEFINE_LIST(PageNodeList, PagesNode)
+
 struct ProcessTransactionsThreadStartArg {
     struct HW8TransactionRecord const *transactionRecordPtr;
+
     float *balancePtr;
-
     pthread_mutex_t *balanceMutexPtr;
-};
 
+    Pages pages;
+    PagesNode initialOwnedPageNode;
+    pthread_mutex_t *pagesMutexPtr;
+};
 static void *processTransactionsThreadStart(void *argAsVoidPtr);
+
+struct PeriodicallyResetPagesReferencedThreadStartArg {
+    Pages pages;
+    pthread_mutex_t *pagesMutexPtr;
+
+    bool *stopPtr;
+};
+static void *periodicallyResetPagesReferencedThreadStart(void *argAsVoidPtr);
 
 /**
  * Run CSCI 451 HW8. This uses the given transaction records to model multithreaded deposit and withdrawal transactions
@@ -46,9 +67,18 @@ void hw8(struct HW8TransactionRecord const * const transactionRecords, size_t co
     guardNotNull(transactionRecords, "transactionRecords", "hw8");
 
     float balance = 0;
-
     pthread_mutex_t balanceMutex;
     safeMutexInit(&balanceMutex, NULL, "hw8");
+
+    Pages const pages = Pages_create();
+    Pages_add(pages, (struct Page){
+        .owner = NULL,
+        .referenced = false,
+        .modified = false
+    });
+    pthread_mutex_t pagesMutex;
+    safeMutexInit(&pagesMutex, NULL, "hw8");
+    safeMutexLock(&pagesMutex, "hw8");
 
     struct ProcessTransactionsThreadStartArg * const threadStartArgs = (
         safeMalloc(sizeof *threadStartArgs * transactionRecordCount, "hw8")
@@ -59,8 +89,18 @@ void hw8(struct HW8TransactionRecord const * const transactionRecords, size_t co
         struct ProcessTransactionsThreadStartArg * const threadStartArgPtr = &threadStartArgs[i];
 
         threadStartArgPtr->transactionRecordPtr = transactionRecordPtr;
+
         threadStartArgPtr->balancePtr = &balance;
         threadStartArgPtr->balanceMutexPtr = &balanceMutex;
+
+        threadStartArgPtr->pages = pages;
+        PagesNode const initialOwnedPageNode = Pages_add(pages, (struct Page){
+            .owner = transactionRecordPtr->name,
+            .referenced = false,
+            .modified = false
+        });
+        threadStartArgPtr->initialOwnedPageNode = initialOwnedPageNode;
+        threadStartArgPtr->pagesMutexPtr = &pagesMutex;
 
         threadIds[i] = safePthreadCreate(
             NULL,
@@ -70,15 +110,35 @@ void hw8(struct HW8TransactionRecord const * const transactionRecords, size_t co
         );
     }
 
+    safeMutexUnlock(&pagesMutex, "hw8");
+
+    bool stopPeriodicallyResettingPagesReferenced = false;
+    safePthreadCreate(
+        NULL,
+        periodicallyResetPagesReferencedThreadStart,
+        &(struct PeriodicallyResetPagesReferencedThreadStartArg){
+            .pages = pages,
+            .pagesMutexPtr = &pagesMutex,
+            .stopPtr = &stopPeriodicallyResettingPagesReferenced
+        },
+        "hw8"
+    );
+
     for (size_t i = 0; i < transactionRecordCount; i += 1) {
         pthread_t const threadId = threadIds[i];
         safePthreadJoin(threadId, "hw8");
     }
 
+    stopPeriodicallyResettingPagesReferenced = true;
+    safeMutexLock(&pagesMutex, "hw8");
+    Pages_destroy(pages);
+    safeMutexUnlock(&pagesMutex, "hw8");
+
     free(threadStartArgs);
     free(threadIds);
 
     safeMutexDestroy(&balanceMutex, "hw8");
+    safeMutexDestroy(&pagesMutex, "hw8");
 
     printf("Final account balance is $%.2f\n", (double)balance);
 }
@@ -103,6 +163,9 @@ static void *processTransactionsThreadStart(void * const argAsVoidPtr) {
     FILE * const transactionFile = (
         safeFopen(argPtr->transactionRecordPtr->filePath, "r", "hw8 processTransactionsThreadStart")
     );
+
+    PageNodeList const ownedPageNodes = PageNodeList_create();
+    PageNodeList_add(ownedPageNodes, argPtr->initialOwnedPageNode);
 
     bool isFirstTransactionSection = true;
     while (true) {
@@ -163,6 +226,94 @@ static void *processTransactionsThreadStart(void * const argAsVoidPtr) {
             balance += transactionAmount;
         }
 
+        safeMutexLock(argPtr->pagesMutexPtr, "hw8 processTransactionsThreadStart");
+
+        for (int i = 0; (size_t)i < PageNodeList_count(ownedPageNodes); i += 1) {
+            PagesNode const ownedPageNode = PageNodeList_get(ownedPageNodes, (size_t)i);
+            if (Pages_item(argPtr->pages, ownedPageNode).owner != argPtr->transactionRecordPtr->name) {
+                PageNodeList_removeAt(ownedPageNodes, (size_t)i);
+                i -= 1;
+            }
+        }
+
+        bool const requireAdditionalPage = randomInt(0, 4) == 0;
+        if (PageNodeList_empty(ownedPageNodes) || requireAdditionalPage) {
+            printf("Page fault in thread %s\n", argPtr->transactionRecordPtr->name);
+
+            PagesNode unownedAdditionalPageNode = NULL;
+            PagesNode class0AdditionalPageNode = NULL;
+            PagesNode class1AdditionalPageNode = NULL;
+            PagesNode class2AdditionalPageNode = NULL;
+            PagesNode class3AdditionalPageNode = NULL;
+
+            PagesNode const headPageNode = Pages_head(argPtr->pages);
+            PagesNode currentPageNode = headPageNode;
+            while (true) {
+                struct Page * const currentPagePtr = Pages_itemPtr(argPtr->pages, currentPageNode);
+
+                if (currentPagePtr->owner == NULL) {
+                    unownedAdditionalPageNode = currentPageNode;
+                    break;
+                }
+
+                bool const currentPageReferenced = currentPagePtr->referenced;
+                bool const currentPageModified = currentPagePtr->modified;
+                if (!currentPageReferenced && !currentPageModified) {
+                    class0AdditionalPageNode = currentPageNode;
+                } else if (!currentPageReferenced && currentPageModified) {
+                    class1AdditionalPageNode = currentPageNode;
+                } else if (currentPageReferenced && !currentPageModified) {
+                    class2AdditionalPageNode = currentPageNode;
+                } else { // currentPageReferenced && currentPageModified
+                    class3AdditionalPageNode = currentPageNode;
+                }
+
+                PagesNode const nextPageNode = Pages_next(argPtr->pages, currentPageNode);
+                if (nextPageNode == headPageNode) {
+                    break;
+                }
+                currentPageNode = nextPageNode;
+            }
+
+            PagesNode const additionalPageNode = (
+                unownedAdditionalPageNode != NULL ? (
+                    unownedAdditionalPageNode
+                ) : class0AdditionalPageNode != NULL ? (
+                    class0AdditionalPageNode
+                ) : class1AdditionalPageNode != NULL ? (
+                    class1AdditionalPageNode
+                ) : class2AdditionalPageNode != NULL ? (
+                    class2AdditionalPageNode
+                ) : ( // class3AdditionalPageNode != NULL
+                    class3AdditionalPageNode
+                )
+            );
+            struct Page * const additionalPagePtr = Pages_itemPtr(argPtr->pages, additionalPageNode);
+            printf(
+                "Page being removed: {owner=%s, referenced=%s, modified=%s}\n",
+                additionalPagePtr->owner == NULL ? "[UNOWNED]" : additionalPagePtr->owner,
+                additionalPagePtr->referenced ? "yes" : "no",
+                additionalPagePtr->modified ? "yes" : "no"
+            );
+
+            PageNodeList_add(ownedPageNodes, additionalPageNode);
+            additionalPagePtr->owner = argPtr->transactionRecordPtr->name;
+            additionalPagePtr->referenced = false;
+            additionalPagePtr->modified = false;
+        }
+
+        for (size_t i = 0; i < PageNodeList_count(ownedPageNodes); i += 1) {
+            PagesNode const ownedPageNode = PageNodeList_get(ownedPageNodes, i);
+            if (balance < 0) {
+                Pages_itemPtr(argPtr->pages, ownedPageNode)->referenced = true;
+                Pages_itemPtr(argPtr->pages, ownedPageNode)->modified = true;
+            } else if (balance > 0) {
+                Pages_itemPtr(argPtr->pages, ownedPageNode)->referenced = true;
+            }
+        }
+
+        safeMutexUnlock(argPtr->pagesMutexPtr, "hw8 processTransactionsThreadStart");
+
         *argPtr->balancePtr = balance;
         printf("Account balance after thread %s is $%.2f\n", argPtr->transactionRecordPtr->name, (double)balance);
 
@@ -171,7 +322,47 @@ static void *processTransactionsThreadStart(void * const argAsVoidPtr) {
         isFirstTransactionSection = false;
     }
 
+    PageNodeList_destroy(ownedPageNodes);
     fclose(transactionFile);
+
+    return NULL;
+}
+
+static void *periodicallyResetPagesReferencedThreadStart(void * const argAsVoidPtr) {
+    assert(argAsVoidPtr != NULL);
+    struct PeriodicallyResetPagesReferencedThreadStartArg * const argPtr = argAsVoidPtr;
+
+    while (true) {
+        nanosleep(&(struct timespec){
+            .tv_sec = 1,
+            .tv_nsec = 0
+        }, NULL);
+
+        if (*argPtr->stopPtr) {
+            break;
+        }
+
+        safeMutexLock(argPtr->pagesMutexPtr, "hw8 periodicallyResetPagesReferencedThreadStart");
+
+        if (*argPtr->stopPtr) {
+            safeMutexUnlock(argPtr->pagesMutexPtr, "hw8 periodicallyResetPagesReferencedThreadStart");
+            break;
+        }
+
+        PagesNode const headPageNode = Pages_head(argPtr->pages);
+        PagesNode currentPageNode = headPageNode;
+        while (true) {
+            Pages_itemPtr(argPtr->pages, currentPageNode)->referenced = false;
+
+            PagesNode const nextPageNode = Pages_next(argPtr->pages, currentPageNode);
+            if (nextPageNode == headPageNode) {
+                break;
+            }
+            currentPageNode = nextPageNode;
+        }
+
+        safeMutexUnlock(argPtr->pagesMutexPtr, "hw8 periodicallyResetPagesReferencedThreadStart");
+    }
 
     return NULL;
 }

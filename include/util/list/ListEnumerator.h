@@ -34,6 +34,8 @@
         int currentIndex; \
     }; \
     \
+    static void TList##Enumerator##_guardCurrentIndexInRange(Const##TList##Enumerator enumerator, char const *callerName); \
+    \
     TList##Enumerator TList##Enumerator##_create(Const##TList const list, int const direction) { \
         guardNotNull(list, "list", STRINGIFY(TList##Enumerator##_create)); \
         \
@@ -58,20 +60,22 @@
     \
     TItem TList##Enumerator##_current(Const##TList##Enumerator const enumerator) { \
         guardNotNull(enumerator, "enumerator", STRINGIFY(TList##Enumerator##_current)); \
-        \
-        if (enumerator->currentIndex < 0 || enumerator->currentIndex >= (int)TList##_count(enumerator->list)) { \
-            abortWithErrorFmt( \
-                "%s: Cannot get current item when current index (%d) is out of range (list count: %zu)", \
-                STRINGIFY(TList##Enumerator##_current), \
-                enumerator->currentIndex, \
-                TList##_count(enumerator->list) \
-            ); \
-        } \
-        \
+        TList##Enumerator##_guardCurrentIndexInRange(enumerator, STRINGIFY(TList##Enumerator##_current)); \
         return TList##_get(enumerator->list, (size_t)enumerator->currentIndex); \
     } \
     \
     void TList##Enumerator##_reset(TList##Enumerator const enumerator) { \
         guardNotNull(enumerator, "enumerator", STRINGIFY(TList##Enumerator##_reset)); \
         enumerator->currentIndex = enumerator->direction == 1 ? -1 : (int)TList##_count(enumerator->list); \
+    } \
+    \
+    static void TList##Enumerator##_guardCurrentIndexInRange(Const##TList##Enumerator const enumerator, char const * const callerName) { \
+        if (enumerator->currentIndex < 0 || enumerator->currentIndex >= (int)TList##_count(enumerator->list)) { \
+            abortWithErrorFmt( \
+                "%s: Current index (%d) is out of range (list count: %zu)", \
+                callerName, \
+                enumerator->currentIndex, \
+                TList##_count(enumerator->list) \
+            ); \
+        } \
     }

@@ -9,6 +9,7 @@
 
 #include "./ListEnumerator.h"
 
+#include <stdlib.h>
 #include <stdbool.h>
 #include <assert.h>
 
@@ -36,8 +37,11 @@
     \
     TItem const *TList##_items(Const##TList list); \
     size_t TList##_count(Const##TList list); \
+    bool TList##_empty(Const##TList list); \
     \
     TItem TList##_get(Const##TList list, size_t index); \
+    TItem *TList##_getPtr(TList list, size_t index); \
+    TItem const *TList##_constGetPtr(Const##TList list, size_t index); \
     \
     void TList##_add(TList list, TItem item); \
     void TList##_addMany(TList list, TItem const *items, size_t count); \
@@ -127,12 +131,27 @@
         return list->count; \
     } \
     \
+    bool TList##_empty(Const##TList list) { \
+        guardNotNull(list, "list", STRINGIFY(TList##_empty)); \
+        return list->count == 0; \
+    } \
+    \
     TItem TList##_get(Const##TList const list, size_t const index) { \
         guardNotNull(list, "list", STRINGIFY(TList##_get)); \
         TList##_guardIndexInRange(list, index, STRINGIFY(TList##_get)); \
-        \
-        TItem const item = list->items[index]; \
-        return item; \
+        return list->items[index]; \
+    } \
+    \
+    TItem *TList##_getPtr(TList const list, size_t const index) { \
+        guardNotNull(list, "list", STRINGIFY(TList##_getPtr)); \
+        TList##_guardIndexInRange(list, index, STRINGIFY(TList##_getPtr)); \
+        return &list->items[index]; \
+    } \
+    \
+    TItem const *TList##_constGetPtr(Const##TList const list, size_t const index) { \
+        guardNotNull(list, "list", STRINGIFY(TList##_constGetPtr)); \
+        TList##_guardIndexInRange(list, index, STRINGIFY(TList##_constGetPtr)); \
+        return &list->items[index]; \
     } \
     \
     void TList##_add(TList const list, TItem const item) { \
@@ -188,7 +207,6 @@
     void TList##_set(TList const list, size_t const index, TItem const item) { \
         guardNotNull(list, "list", STRINGIFY(TList##_set)); \
         TList##_guardIndexInRange(list, index, STRINGIFY(TList##_set)); \
-        \
         list->items[index] = item; \
     } \
     \
